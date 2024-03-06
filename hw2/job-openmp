@@ -1,0 +1,19 @@
+#!/bin/bash
+#SBATCH -N 1
+#SBATCH -n 1
+#SBATCH -c 64
+#SBATCH -J serial
+#SBATCH -t 00:30:00
+
+#OpenMP settings:
+export OMP_NUM_THREADS=64
+export OMP_PLACES=cores
+
+#run the application:
+# srun ./build/serial -s 1 -n 10000
+srun lscpu
+# for ((i=1; i<=32; i*=2)); do
+#     # export OMP_NUM_THREADS=$i
+#     num_particles=$((10000 * i))
+#     srun ./build/serial -s 1 -n $num_particles
+# done
