@@ -1,0 +1,30 @@
+#!/bin/bash
+#SBATCH -N 4
+#SBATCH -J hw4-mpi
+#SBATCH --ntasks-per-node=24
+#SBATCH -t 00:30:00
+
+#run the application:
+echo "Parallel Runtime Plot"
+for ((i=1; i<=32; i*=2)); do
+    num_particles=$((100000 * i))
+    srun ./build/mpi -n $num_particles
+done
+
+# echo "Strong Scaling Plot"
+# for ((i=1; i<=16; i*=2)); do
+#     srun -N1 --ntasks-per-node=$i ./build/mpi -n 500000
+# done
+# for ((i=1; i<=4; i*=2)); do
+#     srun -N$i --ntasks-per-node=24 ./build/mpi -n 500000
+# done
+
+# echo "Weak Scaling Plot"
+# for ((i=1; i<=16; i*=2)); do
+#     num_particles=$((10000 * i))
+#     srun -N1 --ntasks-per-node=$i ./build/mpi -n $num_particles
+# done
+# for ((i=1; i<=4; i*=2)); do
+#     num_particles=$((240000 * i))
+#     srun -N$i --ntasks-per-node=24 ./build/mpi -n $num_particles
+# done
