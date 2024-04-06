@@ -1,0 +1,264 @@
+diff --git a/model.py b/model.py
+index c698f8b..b0d96c6 100644
+--- a/model.py
++++ b/model.py
+@@ -14,6 +14,11 @@ from dataclasses import dataclass
+ import torch
+ import torch.nn as nn
+ from torch.nn import functional as F
++import torch.distributed
++from fmoe.layers import FMoE
++from fmoe.linear import FMoELinear
++import fmoe.gates as gates
++
+ 
+ class LayerNorm(nn.Module):
+     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
+@@ -75,6 +80,74 @@ class CausalSelfAttention(nn.Module):
+         y = self.resid_dropout(self.c_proj(y))
+         return y
+ 
++
++class _Expert(nn.Module):
++    def __init__(
++        self, num_expert, d_model, d_hidden, activation, dropout=0.0, rank=0, bias=True
++    ):
++        super().__init__()
++        self.linear1 = FMoELinear(num_expert, d_model, d_hidden, bias=bias, rank=rank)
++        self.linear2 = FMoELinear(num_expert, d_hidden, d_model, bias=bias, rank=rank)
++        self.dropout = nn.Dropout(dropout)
++        self.activation = activation
++
++    def forward(self, inp, fwd_expert_count):
++        x = self.linear1(inp, fwd_expert_count)
++        x = self.activation(x)
++        # comment out to be consistent with nanoGPT
++        # x = self.dropout(x)
++        x = self.linear2(x, fwd_expert_count)
++        x = self.dropout(x)
++        return x
++
++
++class FeedForwardMoE(FMoE):
++    r"""
++    A complete MoE MLP module in a Transformer block.
++    * `activation` is the activation function to be used in MLP in each expert.
++    * `d_hidden` is the dimension of the MLP layer.
++    """
++
++    def __init__(
++        self,
++        config,
++        num_expert=32,
++        # d_model=1024,
++        # d_hidden=4096,
++        activation=torch.nn.GELU(),
++        # dropout=0.,
++        expert_dp_comm="world",
++        expert_rank=0,
++        **kwargs,
++    ):
++        def one_expert(d_model):
++            # return _Expert(1, d_model, d_hidden, activation, dropout=dropout, rank=0)
++            return _Expert(
++                1,
++                config.n_embd,
++                4 * config.n_embd,
++                activation,
++                dropout=config.dropout,
++                rank=expert_rank,
++            )
++
++        expert = one_expert
++        super().__init__(
++            num_expert=num_expert, d_model=config.n_embd, expert=expert, **kwargs
++        )
++        self.mark_parallel_comm(expert_dp_comm)
++
++    def forward(self, inp: torch.Tensor):
++        r"""
++        This module wraps up the FMoE module with reshape, residual and layer
++        normalization.
++        """
++        original_shape = inp.shape
++        inp = inp.reshape(-1, self.d_model)
++        output = super().forward(inp)
++        return output.reshape(original_shape)
++
++
+ class MLP(nn.Module):
+ 
+     def __init__(self, config):
+@@ -93,16 +166,47 @@ class MLP(nn.Module):
+ 
+ class Block(nn.Module):
+ 
+-    def __init__(self, config):
++    def __init__(
++        self,
++        config,
++        world_size,
++        expert_rank,
++        top_k,
++        num_expert=1,
++        gate=gates.NaiveGate,
++        gate_bias=True,
++    ):
+         super().__init__()
+         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+         self.attn = CausalSelfAttention(config)
+         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+-        self.mlp = MLP(config)
++        # self.mlp = MLP(config)
++        if issubclass(gate, gates.NaiveGate):
++            self.gate = gate(
++                config.n_embd, num_expert, world_size, top_k, gate_bias=gate_bias
++            )
++        else:
++            self.gate = gate(config.n_embd, num_expert, world_size, top_k)
++        self.mlp = FeedForwardMoE(
++            config,
++            num_expert,
++            top_k,
++            # gate=GShardGate,
++            world_size,
++            expert_rank,
++        )
+ 
+     def forward(self, x):
++        x = self.ln_1(x)
++        gate_top_k_idx, gate_score = self.gate(x)
++
++        def schedule(gate_top_k_idx, gate_score):
++            # a sophisticated scheduling algorithm
++            pass
++
++        schedule(gate_top_k_idx, gate_score)
+         x = x + self.attn(self.ln_1(x))
+-        x = x + self.mlp(self.ln_2(x))
++        x = x + self.mlp(self.ln_2(x), gate_top_k_idx, gate_score)
+         return x
+ 
+ @dataclass
+diff --git a/train.py b/train.py
+index 951bda9..e8696ce 100644
+--- a/train.py
++++ b/train.py
+@@ -26,6 +26,8 @@ import numpy as np
+ import torch
+ from torch.nn.parallel import DistributedDataParallel as DDP
+ from torch.distributed import init_process_group, destroy_process_group
++from fmoe.distributed import DistributedGroupedDataParallel
++import torch.amp
+ 
+ from model import GPTConfig, GPT
+ 
+@@ -45,7 +47,7 @@ wandb_project = 'owt'
+ wandb_run_name = 'gpt2' # 'run' + str(time.time())
+ # data
+ dataset = 'openwebtext'
+-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
++gradient_accumulation_steps = 8 # 5 * 8 # used to simulate larger batch sizes
+ batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
+ block_size = 1024
+ # model
+@@ -71,7 +73,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
+ # system
+ device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+ dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+-compile = True # use PyTorch 2.0 to compile the model to be faster
++compile = False # use PyTorch 2.0 to compile the model to be faster
+ # -----------------------------------------------------------------------------
+ config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
+ exec(open('configurator.py').read()) # overrides from command line or config file
+@@ -209,7 +211,8 @@ if compile:
+ 
+ # wrap model into DDP container
+ if ddp:
+-    model = DDP(model, device_ids=[ddp_local_rank])
++    # model = DDP(model, device_ids=[ddp_local_rank])
++    model = DistributedGroupedDataParallel(model)
+ 
+ # helps estimate an arbitrarily accurate loss over either split using many batches
+ @torch.no_grad()
+@@ -260,30 +263,31 @@ while True:
+         param_group['lr'] = lr
+ 
+     # evaluate the loss on train/val sets and write checkpoints
+-    if iter_num % eval_interval == 0 and master_process:
++    if iter_num % eval_interval == 0: # and master_process: in MoE we cannot just perform below section on the master_process
+         losses = estimate_loss()
+-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+-        if wandb_log:
+-            wandb.log({
+-                "iter": iter_num,
+-                "train/loss": losses['train'],
+-                "val/loss": losses['val'],
+-                "lr": lr,
+-                "mfu": running_mfu*100, # convert to percentage
+-            })
+-        if losses['val'] < best_val_loss or always_save_checkpoint:
+-            best_val_loss = losses['val']
+-            if iter_num > 0:
+-                checkpoint = {
+-                    'model': raw_model.state_dict(),
+-                    'optimizer': optimizer.state_dict(),
+-                    'model_args': model_args,
+-                    'iter_num': iter_num,
+-                    'best_val_loss': best_val_loss,
+-                    'config': config,
+-                }
+-                print(f"saving checkpoint to {out_dir}")
+-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
++        if master_process:
++            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
++            if wandb_log:
++                wandb.log({
++                    "iter": iter_num,
++                    "train/loss": losses['train'],
++                    "val/loss": losses['val'],
++                    "lr": lr,
++                    "mfu": running_mfu*100, # convert to percentage
++                })
++        # if losses['val'] < best_val_loss or always_save_checkpoint:
++        #     best_val_loss = losses['val']
++        #     if iter_num > 0:
++        #         checkpoint = {
++        #             'model': raw_model.state_dict(),
++        #             'optimizer': optimizer.state_dict(),
++        #             'model_args': model_args,
++        #             'iter_num': iter_num,
++        #             'best_val_loss': best_val_loss,
++        #             'config': config,
++        #         }
++        #         print(f"saving checkpoint to {out_dir}")
++        #         torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+     if iter_num == 0 and eval_only:
+         break
+ 
+@@ -303,6 +307,7 @@ while True:
+         X, Y = get_batch('train')
+         # backward pass, with gradient scaling if training in fp16
+         scaler.scale(loss).backward()
++        model.allreduce_gradients()
+     # clip the gradient
+     if grad_clip != 0.0:
+         scaler.unscale_(optimizer)
+@@ -332,5 +337,17 @@ while True:
+     if iter_num > max_iters:
+         break
+ 
++checkpoint = {
++    'model': raw_model.state_dict(),
++    'optimizer': optimizer.state_dict(),
++    'model_args': model_args,
++    'iter_num': iter_num,
++    'best_val_loss': best_val_loss,
++    'config': config,
++}
++
++print(f"{ddp_rank} saves ckpt to {out_dir}")
++torch.save(checkpoint, os.path.join(out_dir, f'ckpt_{ddp_rank}.pt'))
++
+ if ddp:
+     destroy_process_group()
