@@ -113,6 +113,13 @@ void init_simulation(particle_t* parts, int num_parts, double size) {
 
     gpuErrchk(cudaMalloc(&bin_cnts, (grid_size + 1) * sizeof(int)));
 
+    int* bin_cnts_cpu;
+    bin_cnts_cpu = new int[grid_size + 1]();
+    bin_cnts_cpu[grid_size] = num_parts;
+    gpuErrchk(
+        cudaMemcpy(bin_cnts, bin_cnts_cpu, (grid_size + 1) * sizeof(int), cudaMemcpyHostToDevice));
+    delete[] bin_cnts_cpu;
+
     // gpuErrchk(cudaMemset(bin_cnts, 0, grid_size * sizeof(int)));
     // gpuErrchk(cudaMemset(bin_cnts + grid_size, num_parts, sizeof(int)));
     gpuErrchk(cudaMalloc(&bin_ptrs, grid_size * sizeof(int)));
@@ -152,23 +159,24 @@ __global__ void assign_parts(particle_t* parts, int num_parts, int* bin_ptrs, in
     parts_by_bins[pos] = tid;
 }
 
-int* bin_cnts_cpu;
-void init_arrays(int num_parts) {
-    static bool first = true;
-    if (first) {
-        bin_cnts_cpu = new int[grid_size + 1]();
-        bin_cnts_cpu[grid_size] = num_parts;
-        first = false;
-    }
-    gpuErrchk(
-        cudaMemcpy(bin_cnts, bin_cnts_cpu, (grid_size + 1) * sizeof(int), cudaMemcpyHostToDevice));
-}
+// int* bin_cnts_cpu;
+// void init_arrays(int num_parts) {
+//     static bool first = true;
+//     if (first) {
+//         bin_cnts_cpu = new int[grid_size + 1]();
+//         bin_cnts_cpu[grid_size] = num_parts;
+//         first = false;
+//     }
+//     gpuErrchk(
+//         cudaMemcpy(bin_cnts, bin_cnts_cpu, (grid_size + 1) * sizeof(int), cudaMemcpyHostToDevice));
+// }
 
 void simulate_one_step(particle_t* parts, int num_parts, double size) {
     // parts live in GPU memory
     // Rewrite this function
 
-    init_arrays(num_parts);
+    // init_arrays(num_parts);
+    gpuErrchk(cudaMemset(bin_cnts, 0, grid_size * sizeof(int)));
     count_bin_parts<<<blks, NUM_THREADS>>>(parts, num_parts, bin_cnts, grid_side_len);
     // gpuErrchk(cudaDeviceSynchronize());
     count_prefix_sum();
@@ -187,5 +195,5 @@ void clear_simulation() {
     cudaFree(bin_cnts);
     cudaFree(bin_ptrs);
     cudaFree(parts_by_bins);
-    delete[] bin_cnts_cpu;
+    // delete[] bin_cnts_cpu;
 }
