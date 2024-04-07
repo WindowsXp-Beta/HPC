@@ -1,0 +1,234 @@
+diff --git a/fmoe/layers.py b/fmoe/layers.py
+index 320511e..c9f53ba 100644
+--- a/fmoe/layers.py
++++ b/fmoe/layers.py
+@@ -152,10 +152,10 @@ class FMoE(nn.Module):
+         else:
+             self.experts_fused = True
+ 
+-        if issubclass(gate, NaiveGate):
+-            self.gate = gate(d_model, num_expert, world_size, top_k, gate_bias=gate_bias)
+-        else:
+-            self.gate = gate(d_model, num_expert, world_size, top_k)
++        # if issubclass(gate, NaiveGate):
++        #     self.gate = gate(d_model, num_expert, world_size, top_k, gate_bias=gate_bias)
++        # else:
++        #     self.gate = gate(d_model, num_expert, world_size, top_k)
+         self.gate_hook = gate_hook
+         self.mask = mask
+         self.mask_dict = mask_dict
+@@ -200,9 +200,9 @@ class FMoE(nn.Module):
+                     mark_module_parallel_comm(e, comm)
+             else:
+                 mark_module_parallel_comm(self.experts, comm)
+-        mark_module_parallel_comm(self.gate, "gate")
++        # mark_module_parallel_comm(self.gate, "gate")
+ 
+-    def forward(self, moe_inp):
++    def forward(self, moe_inp, gate_top_k_idx, gate_score):
+         r"""
+         The FMoE module first computes gate output, and then conduct MoE forward
+         according to the gate.  The score of the selected gate given by the
+@@ -231,8 +231,10 @@ class FMoE(nn.Module):
+ 
+             moe_inp = tree.map_structure(slice_func, moe_inp)
+ 
+-        gate_top_k_idx, gate_score = self.gate(moe_inp)
++        # We bring gating calculation forward
++        # gate_top_k_idx, gate_score = self.gate(moe_inp)
+ 
++        # Currently we don't use gate_hook
+         if self.gate_hook is not None:
+             self.gate_hook(gate_top_k_idx, gate_score, None)
+ 
+diff --git a/fmoe/megatron/layers.py b/fmoe/megatron/layers.py
+index f660cc1..13228d0 100644
+--- a/fmoe/megatron/layers.py
++++ b/fmoe/megatron/layers.py
+@@ -83,23 +83,23 @@ class MegatronMLP(FMoETransformerMLP):
+             from megatron.mpu import get_data_parallel_group
+             moe_group = get_data_parallel_group()
+ 
+-        if not args.balance_strategy or args.balance_strategy == "naive":
+-            from fmoe.gates import NaiveGate
+-            gate = NaiveGate
+-        elif args.balance_strategy == "noisy":
+-            from fmoe.gates import NoisyGate
+-            gate = NoisyGate
+-        elif args.balance_strategy == "gshard":
+-            from fmoe.gates import GShardGate
+-            gate = GShardGate
+-        elif args.balance_strategy == "switch":
+-            from fmoe.gates import SwitchGate
+-            gate = SwitchGate
+-        elif args.balance_strategy == "swipe":
+-            from fmoe.gates import SwipeGate
+-            gate = SwipeGate
+-        elif gate is None:
+-            assert False, "Undefined balance strategy {}" % (args.balance_strategy)
++        # if not args.balance_strategy or args.balance_strategy == "naive":
++        #     from fmoe.gates import NaiveGate
++        #     gate = NaiveGate
++        # elif args.balance_strategy == "noisy":
++        #     from fmoe.gates import NoisyGate
++        #     gate = NoisyGate
++        # elif args.balance_strategy == "gshard":
++        #     from fmoe.gates import GShardGate
++        #     gate = GShardGate
++        # elif args.balance_strategy == "switch":
++        #     from fmoe.gates import SwitchGate
++        #     gate = SwitchGate
++        # elif args.balance_strategy == "swipe":
++        #     from fmoe.gates import SwipeGate
++        #     gate = SwipeGate
++        # elif gate is None:
++        #     assert False, "Undefined balance strategy {}" % (args.balance_strategy)
+ 
+         super().__init__(
+             args.fmoe_num_experts,
+@@ -109,7 +109,7 @@ class MegatronMLP(FMoETransformerMLP):
+             world_size=world_size,
+             moe_group=moe_group,
+             expert_dp_comm="none" if args.distributed_experts else "dp",
+-            gate_hook=generate_megatron_gate_hook(
++            gate_hook=generate_megatron_gate_hook( # currently it's empty
+                 layer_idx, args.fmoe_num_experts * world_size
+             ),
+             gate=gate,
+@@ -130,24 +130,24 @@ class MegatronMLP(FMoETransformerMLP):
+         additional numpy rng is used.
+         """
+         rng = np.random.default_rng(np.random.randint(2048) + self.rank)
+-        
++
+         if type(self.experts) is nn.ModuleList:
+             for expert in self.experts:
+                 _megatron_init_method(expert.htoh4, rng, self.sigma)
+         else:
+             _megatron_init_method(self.experts.htoh4, rng, self.sigma)
+-        
++
+         std = self.sigma / math.sqrt(2.0 * self.num_layers)
+-        
++
+         if type(self.experts) is nn.ModuleList:
+             for expert in self.experts:
+                 _megatron_init_method(expert.h4toh, rng, std)
+         else:
+             _megatron_init_method(self.experts.h4toh, rng, std)
+ 
+-    def forward(self, inp):
++    def forward(self, inp, gate_top_k_idx, gate_score):
+         from megatron import mpu
+-        x = super().forward(inp)
++        x = super().forward(inp, gate_top_k_idx, gate_score)
+         x = mpu.reduce_from_tensor_model_parallel_region(x)
+         return (
+             x,
+@@ -204,7 +204,7 @@ def fmoefy(
+         # initialize gate hook
+         num_layers = len(model.language_model.transformer.layers)
+     elif megatron_version in ["v2.5", "v3.0.2"]:
+-        
++
+         for idx, l in enumerate(model.language_model.encoder.layers):
+             l.mlp = MegatronMLP(args, idx, gate=gate)
+         if hasattr(model.language_model, "decoder") and model.language_model.decoder is not None:
+diff --git a/fmoe/megatron/patch.py b/fmoe/megatron/patch.py
+index 68f0bc6..63e890a 100644
+--- a/fmoe/megatron/patch.py
++++ b/fmoe/megatron/patch.py
+@@ -20,22 +20,22 @@ def patch_loss_func_v2_5(loss_func):
+         args = get_args()
+         assert args.balance_strategy, "Only use patched loss_func when having balance_strategy."
+         assert is_pipeline_last_stage(), "Only call loss_func at pipeline last stage."
+-        
++
+         output = loss_func(output_tensor)
+-        
++
+         while hasattr(model, 'module'):
+             model = model.module
+ 
+-        loss_list = [l.mlp.gate.get_loss(clear=False).view(1)
++        loss_list = [l.gate.get_loss(clear=False).view(1)
+                 for l in model.language_model.encoder.layers
+-                if l.mlp.gate.has_loss]
++                if l.gate.has_loss]
+ 
+         if hasattr(model.language_model, "decoder") and model.language_model.decoder is not None:
+-            loss_list_decoder = [l.mlp.gate.get_loss(clear=False).view(1)
++            loss_list_decoder = [l.gate.get_loss(clear=False).view(1)
+                     for l in model.language_model.decoder.layers
+-                    if l.mlp.gate.has_loss]
++                    if l.gate.has_loss]
+             loss_list.append(loss_list_decoder)
+-            
++
+         if len(loss_list) == 0:
+             return output
+ 
+@@ -110,13 +110,17 @@ def patch_forward_step(forward_step_func, Megatron_Version="v2.2"):
+     def forward_step_with_balance_loss_v2_5(data_iterator, model):
+         from functools import partial
+         output, loss_func = forward_step_func(data_iterator, model)
+-    
++
+         while hasattr(model, 'module'):
+             model = model.module
+ 
+-        loss_list = [l.mlp.gate.get_loss(clear=False).view(1)
++        # loss_list = [l.mlp.gate.get_loss(clear=False).view(1)
++        #         for l in model.language_model.encoder.layers
++        #         if l.mlp.gate.has_loss]
++
++        loss_list = [l.gate.get_loss(clear=False).view(1)
+                 for l in model.language_model.encoder.layers
+-                if l.mlp.gate.has_loss]
++                if l.gate.has_loss]
+ 
+         bal_loss = torch.cat(loss_list).mean() * get_args().balance_loss_weight / get_args().pipeline_model_parallel_size
+         return output, partial(patch_loss_func_v2_5(loss_func), model), bal_loss
+@@ -151,7 +155,7 @@ def patch_model_provider(model_provider, gate=None, Megatron_Version='v2.2'):
+             gate=gate,
+             megatron_version="v2.2"
+         )
+-    
++
+     def fmoefied_model_provider_v2_5(pre_process, post_process):
+         from .layers import fmoefy
+         args = get_args()
+@@ -168,7 +172,7 @@ def patch_model_provider(model_provider, gate=None, Megatron_Version='v2.2'):
+             gate=gate,
+             megatron_version="v2.5"
+         )
+-    
++
+     def fmoefied_model_provider_v3_0_2(pre_process, post_process):
+         from .layers import fmoefy
+         args = get_args()
+diff --git a/fmoe/transformer.py b/fmoe/transformer.py
+index 2d86cf2..b71188b 100644
+--- a/fmoe/transformer.py
++++ b/fmoe/transformer.py
+@@ -50,17 +50,17 @@ class FMoETransformerMLP(FMoE):
+     ):
+         def one_expert(d_model):
+             return _Expert(1, d_model, d_hidden, activation, rank=0)
+-        
++
+         expert = one_expert
+         super().__init__(num_expert=num_expert, d_model=d_model, expert=expert, **kwargs)
+         self.mark_parallel_comm(expert_dp_comm)
+ 
+-    def forward(self, inp: torch.Tensor):
++    def forward(self, inp: torch.Tensor, gate_top_k_idx, gate_score):
+         r"""
+         This module wraps up the FMoE module with reshape, residual and layer
+         normalization.
+         """
+         original_shape = inp.shape
+         inp = inp.reshape(-1, self.d_model)
+-        output = super().forward(inp)
++        output = super().forward(inp, gate_top_k_idx, gate_score)
+         return output.reshape(original_shape)

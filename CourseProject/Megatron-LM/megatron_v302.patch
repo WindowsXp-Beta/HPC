@@ -1,0 +1,787 @@
+diff --git a/examples/pretrain_gpt_distributed.sh b/examples/pretrain_gpt_distributed.sh
+index dc2fe40c..f478e4da 100755
+--- a/examples/pretrain_gpt_distributed.sh
++++ b/examples/pretrain_gpt_distributed.sh
+@@ -10,8 +10,8 @@ NNODES=1
+ NODE_RANK=0
+ WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
+ 
+-DATA_PATH=<Specify path and file prefix>_text_document
+-CHECKPOINT_PATH=<Specify path>
++DATA_PATH=./data/wikipedia_simple_text_document
++CHECKPOINT_PATH=gpt2-wikipedia
+ 
+ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
+ 
+@@ -20,8 +20,8 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
+        --num-layers 24 \
+        --hidden-size 1024 \
+        --num-attention-heads 16 \
+-       --micro-batch-size 8 \
+-       --global-batch-size 64 \
++       --micro-batch-size 1 \
++       --global-batch-size 8 \
+        --seq-length 1024 \
+        --max-position-embeddings 1024 \
+        --train-iters 500000 \
+@@ -29,8 +29,8 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
+        --save $CHECKPOINT_PATH \
+        --load $CHECKPOINT_PATH \
+        --data-path $DATA_PATH \
+-       --vocab-file gpt2-vocab.json \
+-       --merge-file gpt2-merges.txt \
++       --vocab-file ./data/gpt2-vocab.json \
++       --merge-file ./data/gpt2-merges.txt \
+        --data-impl mmap \
+        --split 949,50,1 \
+        --distributed-backend nccl \
+@@ -40,9 +40,13 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
+        --weight-decay 1e-2 \
+        --clip-grad 1.0 \
+        --lr-warmup-fraction .01 \
+-       --activations-checkpoint-method uniform \
++       --recompute-method uniform \
+        --log-interval 100 \
+        --save-interval 10000 \
+        --eval-interval 1000 \
+        --eval-iters 10 \
+-       --fp16
++       --fp16 \
++       --no-contiguous-buffers-in-local-ddp \
++       --fmoefy \
++       --balance-strategy gshard \
++       --fmoe-num-experts 1
+diff --git a/megatron/arguments.py b/megatron/arguments.py
+index 102e890a..c954c83a 100644
+--- a/megatron/arguments.py
++++ b/megatron/arguments.py
+@@ -20,6 +20,9 @@ import os
+ 
+ import torch
+ 
++# FastMoE
++from fmoe.megatron import add_fmoe_args as _add_fmoe_args
++
+ def parse_args(extra_args_provider=None, defaults={},
+                ignore_unknown_args=False):
+     """Parse all arguments."""
+@@ -43,6 +46,9 @@ def parse_args(extra_args_provider=None, defaults={},
+     parser = _add_logging_args(parser)
+     parser = _add_inference_args(parser)
+ 
++    # FastMoE arguments.
++    parser = _add_fmoe_args(parser)
++
+     # Custom arguments.
+     if extra_args_provider is not None:
+         parser = extra_args_provider(parser)
+@@ -316,6 +322,12 @@ def parse_args(extra_args_provider=None, defaults={},
+     if args.sequence_parallel:
+         args.async_tensor_model_parallel_allreduce = False
+ 
++    # if fmoe_num_experts is not specified,
++    # we are using lower version of megatron,
++    # copy num_experts to fmoe_num_experts
++    if not hasattr(args, 'fmoe_num_experts'):
++        args.fmoe_num_experts = args.num_experts
++
+     _print_args(args)
+     return args
+ 
+@@ -350,7 +362,7 @@ def _add_inference_args(parser):
+ 
+     return parser
+ 
+-    
++
+ def _add_network_size_args(parser):
+     group = parser.add_argument_group(title='network size')
+ 
+@@ -744,7 +756,7 @@ def _add_distributed_args(parser):
+     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
+                        help='Use scatter/gather to optimize communication of tensors in pipeline',
+                        dest='scatter_gather_tensors_in_pipeline')
+-    group.add_argument('--local_rank', type=int, default=None,
++    group.add_argument('--local-rank', type=int, default=None,
+                        help='local rank passed from distributed launcher.')
+     group.add_argument('--lazy-mpu-init', type=bool, required=False,
+                        help='If set to True, initialize_megatron() '
+@@ -947,14 +959,14 @@ def _add_vision_args(parser):
+     group.add_argument('--swin-backbone-type', type=str, default='tiny',
+                        choices=['tiny', 'base', 'h3'],
+                        help='pretraining objectives')
+-    
++
+     # inpainting arguments
+     group.add_argument('--mask-type', type=str, default='random',
+                        choices=['random', 'row'],
+                        help='mask types')
+     group.add_argument('--mask-factor', type=float, default=1.0,
+                        help='mask size scaling parameter')
+- 
++
+     # dino arguments
+     group.add_argument('--iter-per-epoch', type=int, default=1250,
+                        help='iterations per epoch')
+diff --git a/megatron/checkpointing.py b/megatron/checkpointing.py
+index ceba3523..01754d03 100644
+--- a/megatron/checkpointing.py
++++ b/megatron/checkpointing.py
+@@ -124,6 +124,10 @@ def read_metadata(tracker_filename):
+                 sys.exit()
+     assert iteration > 0 or release, 'error parsing metadata file {}'.format(
+         tracker_filename)
++    
++    args = get_args()
++    if args.fmoefy:
++        return iteration, release
+ 
+     # Get the max iteration retrieved across the ranks.
+     iters_cuda = torch.cuda.LongTensor([iteration])
+@@ -134,6 +138,7 @@ def read_metadata(tracker_filename):
+     # If not, print a warning and chose the maximum
+     # iteration across all ranks.
+     if iteration != max_iter:
++        rank = torch.distributed.get_rank()
+         print('WARNING: on rank {} found iteration {} in the '
+               'metadata while max iteration across the ranks '
+               'is {}, replacing it with max iteration.'.format(
+@@ -399,7 +404,8 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
+                     opt_param_scheduler.load_state_dict(state_dict['lr_scheduler'])
+                 else:
+                     opt_param_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
+-        except KeyError:
++        except KeyError as e:
++            print(e)
+             print_rank_0('Unable to load optimizer from checkpoint {}. '
+                          'Specify --no-load-optim or --finetune to prevent '
+                          'attempting to load the optimizer state, '
+diff --git a/megatron/data/indexed_dataset.py b/megatron/data/indexed_dataset.py
+index 2f6e1b84..e2483dbd 100644
+--- a/megatron/data/indexed_dataset.py
++++ b/megatron/data/indexed_dataset.py
+@@ -95,7 +95,7 @@ dtypes = {
+     3: np.int16,
+     4: np.int32,
+     5: np.int64,
+-    6: np.float,
++    6: np.float32,
+     7: np.double,
+     8: np.uint16
+ }
+@@ -268,7 +268,7 @@ class IndexedDatasetBuilder(object):
+         np.int16: 2,
+         np.int32: 4,
+         np.int64: 8,
+-        np.float: 4,
++        np.float32: 4,
+         np.double: 8
+     }
+ 
+diff --git a/megatron/model/language_model.py b/megatron/model/language_model.py
+index 6cec08cf..5f8aca82 100644
+--- a/megatron/model/language_model.py
++++ b/megatron/model/language_model.py
+@@ -181,7 +181,7 @@ class Embedding(MegatronModule):
+         else:
+             self.tokentype_embeddings = None
+ 
+-        self.fp32_residual_connection = args.fp32_residual_connection 
++        self.fp32_residual_connection = args.fp32_residual_connection
+         self.sequence_parallel = args.sequence_parallel
+         # Embeddings dropout
+         self.embedding_dropout = torch.nn.Dropout(embedding_dropout_prob)
+@@ -353,6 +353,26 @@ class TransformerLanguageModel(MegatronModule):
+                                        self.num_tokentypes)
+             self._embedding_key = 'embedding'
+ 
++        # gating of MoE, we bring the gating calculation ahead so that we can calculate scheduling earlier
++
++        if not args.balance_strategy or args.balance_strategy == "naive":
++            from fmoe.gates import NaiveGate
++            gate = NaiveGate
++        elif args.balance_strategy == "noisy":
++            from fmoe.gates import NoisyGate
++            gate = NoisyGate
++        elif args.balance_strategy == "gshard":
++            from fmoe.gates import GShardGate
++            gate = GShardGate
++        elif args.balance_strategy == "switch":
++            from fmoe.gates import SwitchGate
++            gate = SwitchGate
++        elif args.balance_strategy == "swipe":
++            from fmoe.gates import SwipeGate
++            gate = SwipeGate
++        elif gate is None:
++            assert False, "Undefined balance strategy {}" % (args.balance_strategy)
++
+         # Transformer.
+         # Encoder (usually set to True, False if part of an encoder-decoder
+         # architecture and in encoder-only stage).
+@@ -362,7 +382,8 @@ class TransformerLanguageModel(MegatronModule):
+                 output_layer_init_method,
+                 self_attn_mask_type=self.encoder_attn_mask_type,
+                 pre_process=self.pre_process,
+-                post_process=self.post_process
++                post_process=self.post_process,
++                gate=gate
+             )
+             self._encoder_key = 'encoder'
+         else:
+@@ -430,6 +451,7 @@ class TransformerLanguageModel(MegatronModule):
+         else:
+             encoder_input = None
+ 
++
+         # Run encoder.
+         if enc_hidden_states is None:
+             if self.encoder is not None:
+@@ -442,6 +464,7 @@ class TransformerLanguageModel(MegatronModule):
+         else:
+             encoder_output = enc_hidden_states.to(encoder_input.dtype)
+ 
++
+         if self.post_process:
+             if self.add_pooler:
+                 pooled_output = self.pooler(encoder_output,
+diff --git a/megatron/model/transformer.py b/megatron/model/transformer.py
+index 33c1551b..551db195 100644
+--- a/megatron/model/transformer.py
++++ b/megatron/model/transformer.py
+@@ -27,7 +27,7 @@ from megatron.model import LayerNorm
+ from megatron.model.fused_softmax import FusedScaleMaskSoftmax
+ from megatron.model.fused_bias_gelu import bias_gelu_impl
+ from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
+-
++import fmoe.gates as gates
+ 
+ """ We use the following notation throughout this file:
+      h: hidden size
+@@ -45,7 +45,7 @@ from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
+ """
+ 
+ class DropPath(MegatronModule):
+-    """Drop paths (Stochastic Depth) per sample 
++    """Drop paths (Stochastic Depth) per sample
+     (when applied in main path of residual blocks).
+     """
+ 
+@@ -149,7 +149,7 @@ class SwitchMLP(MegatronModule):
+         output_total = torch.empty_like(hidden_states)
+         output_bias_total = torch.empty_like(hidden_states)
+         #TODO (rprenger) This does each expert in serial, but it could be parallelized
+-        
++
+         for expert_num, expert in enumerate(self.experts):
+             local_indices = (max_ind == expert_num).nonzero()
+             hidden = hidden_states[local_indices,:]
+@@ -531,7 +531,8 @@ class ParallelTransformerLayer(MegatronModule):
+     def __init__(self, init_method, output_layer_init_method,
+                  layer_number, layer_type=LayerType.encoder,
+                  self_attn_mask_type=AttnMaskType.padding,
+-                 drop_path_rate=0.):
++                 drop_path_rate=0.,
++                 gate=gates.NaiveGate, gate_bias=True):
+         args = get_args()
+ 
+         super(ParallelTransformerLayer, self).__init__()
+@@ -544,6 +545,17 @@ class ParallelTransformerLayer(MegatronModule):
+         self.bf16 = args.bf16
+         self.fp32_residual_connection = args.fp32_residual_connection
+ 
++        # instantiate self.gate
++        world_size = args.data_parallel_size
++        if issubclass(gate, gates.NaiveGate):
++            self.gate = gate(args.hidden_size, args.fmoe_num_experts, world_size, args.top_k, gate_bias=gate_bias)
++        else:
++            self.gate = gate(args.hidden_size, args.fmoe_num_experts, world_size, args.top_k)
++
++        # TODO(wxp): this func is originally called in FMoE.mark_parallel_comm
++        from fmoe.layers import mark_module_parallel_comm
++        mark_module_parallel_comm(self.gate, "gate")
++
+         # Layernorm on the input data.
+         self.input_layernorm = LayerNorm(
+             args.hidden_size,
+@@ -602,6 +614,13 @@ class ParallelTransformerLayer(MegatronModule):
+ 
+         # Layer norm at the beginning of the transformer layer.
+         layernorm_output = self.input_layernorm(hidden_states)
++
++        # calculate gating
++        original_shape = layernorm_output.shape
++        layernorm_output = layernorm_output.reshape(-1, get_args().hidden_size)
++        gate_top_k_idx, gate_score = self.gate(layernorm_output)
++        layernorm_output = layernorm_output.reshape(original_shape)
++
+         # Self attention.
+         attention_output, attention_bias = \
+             self.self_attention(
+@@ -665,7 +684,7 @@ class ParallelTransformerLayer(MegatronModule):
+             layernorm_output = self.post_inter_attention_layernorm(layernorm_input)
+ 
+         # MLP.
+-        mlp_output, mlp_bias = self.mlp(layernorm_output)
++        mlp_output, mlp_bias = self.mlp(layernorm_output, gate_top_k_idx, gate_score)
+ 
+         # Second residual connection.
+         if self.apply_residual_connection_post_layernorm:
+@@ -721,9 +740,10 @@ class ParallelTransformer(MegatronModule):
+     def __init__(self, init_method, output_layer_init_method,
+                  layer_type=LayerType.encoder,
+                  self_attn_mask_type=AttnMaskType.padding,
+-                 post_layer_norm=True, 
++                 post_layer_norm=True,
+                  pre_process=True, post_process=True,
+-                 drop_path_rate=0.0):
++                 drop_path_rate=0.0,
++                 gate=None):
+         super(ParallelTransformer, self).__init__()
+         args = get_args()
+ 
+@@ -760,7 +780,8 @@ class ParallelTransformer(MegatronModule):
+                 layer_number,
+                 layer_type=layer_type,
+                 self_attn_mask_type=self_attn_mask_type,
+-                drop_path_rate=self.drop_path_rates[layer_number - 1])
++                drop_path_rate=self.drop_path_rates[layer_number - 1],
++                gate=gate)
+         if args.virtual_pipeline_model_parallel_size is not None:
+             assert args.num_layers % args.virtual_pipeline_model_parallel_size == 0, \
+                 'num_layers_per_stage must be divisible by ' \
+@@ -898,7 +919,7 @@ class ParallelTransformer(MegatronModule):
+         #   However, we don't explicitly check mbs == 1 here because
+         #   make_viewless_tensor() has negligible overhead when its input
+         #   is already viewless.
+-        # 
++        #
+         # - For the 'else' case above, calling make_viewless_tensor() here is
+         #   likely redundant, since p2p_communication.py (likely originator)
+         #   already creates viewless tensors. That said, make_viewless_tensor()
+diff --git a/megatron/optimizer/__init__.py b/megatron/optimizer/__init__.py
+index d8bee27d..6f4ecfb5 100644
+--- a/megatron/optimizer/__init__.py
++++ b/megatron/optimizer/__init__.py
+@@ -101,8 +101,9 @@ def get_megatron_optimizer(model,
+ 
+     # Determine whether the params have main-grad field.
+     params_have_main_grad = False
+-    if args.DDP_impl == 'local':
+-        params_have_main_grad = True
++    # FastMoE does not have main_grad field
++    # if args.DDP_impl == 'local':
++    #     params_have_main_grad = True
+ 
+     if args.fp16 or args.bf16:
+ 
+diff --git a/megatron/optimizer/clip_grads.py b/megatron/optimizer/clip_grads.py
+index 36cd9156..f8efb099 100644
+--- a/megatron/optimizer/clip_grads.py
++++ b/megatron/optimizer/clip_grads.py
+@@ -16,7 +16,7 @@
+ """Gradient clipping."""
+ 
+ import torch
+-from torch._six import inf
++from torch import inf
+ 
+ from apex.multi_tensor_apply import multi_tensor_applier
+ import amp_C
+@@ -54,6 +54,8 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
+     #   - should not be a replica due to tensor model parallelism
+     grads = []
+     grads_for_norm = []
++    # FastMoE
++    grads_in_moe = []
+     for param in parameters:
+         grad_not_none = param.grad is not None
+         is_not_shared = param_is_not_shared(param)
+@@ -65,7 +67,11 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
+             assert param.grad.type() == 'torch.cuda.FloatTensor'
+             grads.append(grad)
+         if grad_not_none and is_not_shared and is_not_tp_duplicate:
+-            grads_for_norm.append(grad)
++            # FastMoE
++            if hasattr(param, 'dp_comm') and param.dp_comm in ('none'):
++                grads_in_moe.append(grad)
++            else:
++                grads_for_norm.append(grad)
+ 
+     # Norm parameters.
+     max_norm = float(max_norm)
+@@ -74,6 +80,8 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
+ 
+     # Calculate norm.
+     if norm_type == inf:
++        # FastMoE TODO
++        assert False, f"norm_type {norm_type} is not supported by FastMoE "
+         total_norm = max(grad.abs().max() for grad in grads_for_norm)
+         total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
+         # Take max across all model-parallel GPUs.
+@@ -98,7 +106,20 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
+             # we need the pow(norm-type).
+             total_norm = grad_norm ** norm_type
+ 
++            # FastMoE
++            if len(grads_in_moe) > 0 : # 'cold' experts may not have any grads in one iteration
++                grad_norm, _ = multi_tensor_applier(
++                    amp_C.multi_tensor_l2norm,
++                    dummy_overflow_buf,
++                    [grads_in_moe],
++                    False # no per-parameter norm
++                )
++                grad_norm = grad_norm ** norm_type
++                torch.distributed.all_reduce(grad_norm, op=torch.distributed.ReduceOp.SUM, group=mpu.get_model_parallel_group())
++                total_norm += grad_norm
+         else:
++            # FastMoE TODO
++            assert False, f"norm_type {norm_type} is not supported by FastMoE "
+             for grad in grads_for_norm:
+                 grad_norm = torch.norm(grad, norm_type)
+                 total_norm += grad_norm ** norm_type
+diff --git a/megatron/optimizer/optimizer.py b/megatron/optimizer/optimizer.py
+index d6ac42ec..7eecff4e 100644
+--- a/megatron/optimizer/optimizer.py
++++ b/megatron/optimizer/optimizer.py
+@@ -257,6 +257,9 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
+                                                                   param)
+                         if hasattr(param, 'shared'):
+                             main_param.shared = param.shared
++                        # FastMoE
++                        if hasattr(param, 'dp_comm'):
++                            main_param.dp_comm = param.dp_comm
+                         # Replace the optimizer params with the new fp32 copy.
+                         param_group['params'][i] = main_param
+                         fp32_from_float16_params_this_group.append(main_param)
+@@ -411,18 +414,27 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
+             # We are done with scaling gradients
+             # so we can update the loss scale.
+             self.grad_scaler.update(found_inf_flag)
+-
++            
++            # move to L433-L436
+             # If we found inf/nan, skip the update.
+-            if found_inf_flag:
+-                return False, None, None
++            # if found_inf_flag:
++            #    return False, None, None
+ 
+         # Clip the main gradients.
+         timers('optimizer-clip-main-grad').start()
+         grad_norm = None
+-        if self.clip_grad > 0.0:
+-            grad_norm = self.clip_grad_norm(self.clip_grad)
++
++        # remove if branch to avoid dead-lock in FastMoE
++        # if self.clip_grad > 0.0:
++        #     grad_norm = self.clip_grad_norm(self.clip_grad)
++        grad_norm = self.clip_grad_norm(self.clip_grad)
+         timers('optimizer-clip-main-grad').stop()
+ 
++        # move early return to here to avoid dead-lock in FastMoE 
++        # If we found inf/nan, skip the update.
++        if found_inf_flag:
++            return False, None, None
++
+         # count the zeros in the grads
+         num_zeros_in_grad = self.count_zeros() if \
+                             self.log_num_zeros_in_grad else None
+diff --git a/megatron/schedules.py b/megatron/schedules.py
+index ac5ba6f6..26b717a4 100644
+--- a/megatron/schedules.py
++++ b/megatron/schedules.py
+@@ -24,7 +24,10 @@ from megatron import get_timers
+ from megatron import mpu
+ from megatron import p2p_communication
+ from megatron.utils import unwrap_model
+-from megatron.model import DistributedDataParallel as LocalDDP
++
++# FastMoE
++# from megatron.model import DistributedDataParallel as LocalDDP
++from fmoe.megatron import DistributedDataParallel as LocalDDP
+ from megatron.model import Float16Module
+ from megatron.model import ModelType
+ 
+@@ -66,7 +69,7 @@ def deallocate_output_tensor(out):
+         dtype = out.dtype,
+     )
+         
+-def custom_backward(output, grad_output):
++def custom_backward(output, grad_output, bal_loss):
+     '''Directly call C++ autograd engine.
+ 
+     To make the 'deallocate_output_tensor' (above) optimization work, the C++
+@@ -89,11 +92,16 @@ def custom_backward(output, grad_output):
+             output,
+             memory_format = torch.preserve_format,
+         )
++        tensors = (output,)
++        grad_tensors = (grad_output,)
++    else:
++        tensors = (output, bal_loss)
++        grad_tensors = (grad_output, None)
+ 
+     # Call c++ engine [ see torch/csrc/autograd/python_engine.cpp ]
+     Variable._execution_engine.run_backward(
+-        tensors = (output,),
+-        grad_tensors = (grad_output,),
++        tensors = tensors,
++        grad_tensors = grad_tensors,
+         keep_graph = False,
+         create_graph = False,
+         inputs = tuple(),
+@@ -127,7 +135,8 @@ def forward_step(forward_step_func,
+         unwrap_output_tensor = True
+ 
+     unwrapped_model.set_input_tensor(input_tensor)
+-    output_tensor, loss_func = forward_step_func(data_iterator, model)
++    output_tensor, loss_func, bal_loss = forward_step_func(data_iterator, model)
++    bal_loss = bal_loss / get_num_microbatches()
+     if mpu.is_pipeline_last_stage():
+         if not collect_non_loss_data:
+             output_tensor = loss_func(output_tensor)
+@@ -145,13 +154,14 @@ def forward_step(forward_step_func,
+     # downstream as well.
+     if mpu.is_pipeline_stage_after_split() and \
+             args.model_type == ModelType.encoder_and_decoder:
++        assert False, f"encoder-decoder model is not supported by FastMoE "
+         return [output_tensor, input_tensor[-1]]
+     if unwrap_output_tensor:
+-        return output_tensor
+-    return [output_tensor]
++        return output_tensor, bal_loss
++    return [output_tensor, bal_loss]
+ 
+ 
+-def backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad):
++def backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad, bal_loss):
+     """Backward step through passed-in output tensor.
+ 
+     If last stage, output_tensor_grad is None, otherwise gradient of loss
+@@ -185,7 +195,7 @@ def backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad):
+     # Backward pass.
+     if output_tensor_grad[0] is None:
+         output_tensor = optimizer.scale_loss(output_tensor[0])
+-    custom_backward(output_tensor[0], output_tensor_grad[0])
++    custom_backward(output_tensor[0], output_tensor_grad[0], bal_loss)
+ 
+     # Collect the grad of the input_tensor.
+     input_tensor_grad = [None]
+@@ -241,20 +251,20 @@ def forward_backward_no_pipelining(forward_step_func,
+     input_tensor, output_tensor_grad = None, None
+     with context_handler():
+         for i in range(get_num_microbatches() - 1):
+-            output_tensor = forward_step(forward_step_func, data_iterator,
++            output_tensor, bal_loss = forward_step(forward_step_func, data_iterator,
+                                          model, input_tensor, forward_data_store,
+                                          collect_non_loss_data)
+             if not forward_only:
+                 backward_step(optimizer, input_tensor, output_tensor,
+-                              output_tensor_grad)
++                              output_tensor_grad, bal_loss)
+ 
+     # Run computation for last microbatch out of context handler (want to
+     # synchronize gradients).
+-    output_tensor = forward_step(forward_step_func, data_iterator,
++    output_tensor, bal_loss = forward_step(forward_step_func, data_iterator,
+                                  model, input_tensor, forward_data_store,
+                                  collect_non_loss_data)
+     if not forward_only:
+-        backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad)
++        backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad, bal_loss)
+ 
+     return forward_data_store
+ 
+@@ -269,6 +279,8 @@ def forward_backward_pipelining_with_interleaving(forward_step_func,
+     communication between pipeline stages as needed.
+ 
+     Returns dictionary with losses if the last stage, empty dict otherwise."""
++    # FastMoE TODO
++    assert False, "FastMoE not supports pipeline with interleaving"
+     input_tensors = [[] for _ in range(len(model))]
+     output_tensors = [[] for _ in range(len(model))]
+     forward_data_store = []
+@@ -646,15 +658,17 @@ def forward_backward_pipelining_without_interleaving(forward_step_func,
+     # Input, output tensors only need to be saved when doing backward passes
+     input_tensors = None
+     output_tensors = None
++    bal_losses = None
+     if not forward_only:
+         input_tensors = []
+         output_tensors = []
++        bal_losses = []
+     forward_data_store = []
+ 
+     # Run warmup forward passes.
+     for i in range(num_warmup_microbatches):
+         input_tensor = recv_forward(recv_tensor_shapes, timers=timers)
+-        output_tensor = forward_step(forward_step_func, data_iterator, model,
++        output_tensor, bal_loss = forward_step(forward_step_func, data_iterator, model,
+                                      input_tensor, forward_data_store,
+                                      collect_non_loss_data)
+         send_forward(output_tensor, send_tensor_shapes, timers=timers)
+@@ -662,6 +676,7 @@ def forward_backward_pipelining_without_interleaving(forward_step_func,
+         if not forward_only:
+             input_tensors.append(input_tensor)
+             output_tensors.append(output_tensor)
++            bal_losses.append(bal_loss)
+             deallocate_output_tensor(output_tensor[0])
+ 
+     # Before running 1F1B, need to receive first forward tensor.
+@@ -674,7 +689,7 @@ def forward_backward_pipelining_without_interleaving(forward_step_func,
+     for i in range(num_microbatches_remaining):
+         last_iteration = (i == (num_microbatches_remaining - 1))
+ 
+-        output_tensor = forward_step(forward_step_func, data_iterator, model,
++        output_tensor, bal_loss = forward_step(forward_step_func, data_iterator, model,
+                                      input_tensor, forward_data_store,
+                                      collect_non_loss_data)
+         if forward_only:
+@@ -692,16 +707,18 @@ def forward_backward_pipelining_without_interleaving(forward_step_func,
+             # Add input_tensor and output_tensor to end of list.
+             input_tensors.append(input_tensor)
+             output_tensors.append(output_tensor)
++            bal_losses.append(bal_loss)
+             deallocate_output_tensor(output_tensor[0])
+ 
+             # Pop input_tensor and output_tensor from the start of the list for
+             # the backward pass.
+             input_tensor = input_tensors.pop(0)
+             output_tensor = output_tensors.pop(0)
++            bal_loss = bal_loss.pop(0)
+ 
+             input_tensor_grad = \
+                 backward_step(optimizer, input_tensor, output_tensor,
+-                              output_tensor_grad)
++                              output_tensor_grad, bal_loss)
+ 
+             if last_iteration:
+                 input_tensor = None
+@@ -716,12 +733,13 @@ def forward_backward_pipelining_without_interleaving(forward_step_func,
+         for i in range(num_warmup_microbatches):
+             input_tensor = input_tensors.pop(0)
+             output_tensor = output_tensors.pop(0)
++            bal_loss = bal_losses.pop(0)
+ 
+             output_tensor_grad = recv_backward(send_tensor_shapes, timers=timers)
+ 
+             input_tensor_grad = \
+                 backward_step(optimizer, input_tensor, output_tensor,
+-                              output_tensor_grad)
++                              output_tensor_grad, bal_loss)
+ 
+             send_backward(input_tensor_grad, recv_tensor_shapes, timers=timers)
+ 
+diff --git a/megatron/training.py b/megatron/training.py
+index 023bdf17..fdae2442 100644
+--- a/megatron/training.py
++++ b/megatron/training.py
+@@ -36,8 +36,13 @@ from megatron import update_num_microbatches
+ from megatron import mpu
+ from megatron import print_rank_0
+ from megatron import print_rank_last
+-from megatron.checkpointing import load_checkpoint
+-from megatron.checkpointing import save_checkpoint
++
++# FastMoE
++# from megatron.checkpointing import load_checkpoint
++from fmoe.megatron.checkpoint import load_checkpoint
++# from megatron.checkpointing import save_checkpoint
++from fmoe.megatron.checkpoint import save_checkpoint
++
+ from megatron.model import Float16Module
+ from megatron.model import ModelType
+ from megatron.optimizer import get_megatron_optimizer
+@@ -45,7 +50,11 @@ from megatron.initialize import initialize_megatron
+ from megatron.initialize import write_args_to_tensorboard
+ from megatron.initialize import set_jit_fusion_options
+ from megatron.optimizer_param_scheduler import OptimizerParamScheduler
+-from megatron.model import DistributedDataParallel as LocalDDP
++
++# FastMoE
++# from megatron.model import DistributedDataParallel as LocalDDP
++from fmoe.megatron import DistributedDataParallel as LocalDDP
++
+ from megatron.utils import check_adlr_autoresume_termination
+ from megatron.utils import unwrap_model
+ from megatron.data.data_samplers import build_pretraining_data_loader
+@@ -119,6 +128,15 @@ def pretrain(train_valid_test_dataset_provider,
+     args = get_args()
+     timers = get_timers()
+ 
++    # Initialize FastMoE
++    if args.fmoefy:
++        if torch.distributed.get_rank() == 0:
++            print("** FastMoE Enabled **")
++        from fmoe.megatron import patch_forward_step, patch_model_provider
++
++        forward_step_func = patch_forward_step(forward_step_func, Megatron_Version="v3.0.2")
++        model_provider = patch_model_provider(model_provider, Megatron_Version='v3.0.2')
++
+     # Model, optimizer, and learning rate.
+     timers('model-and-optimizer-setup').start()
+     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(model_provider,
+@@ -428,7 +446,7 @@ def train_step(forward_step_func, data_iterator,
+             args.sequence_parallel:
+         grads = []
+         for model_module in model:
+-            unwrapped_model = unwrap_model( 
++            unwrapped_model = unwrap_model(
+                 model_module, (torchDDP, LocalDDP, Float16Module))
+             for param in unwrapped_model.parameters():
+                 if getattr(param, 'sequence_parallel', False):
+@@ -466,13 +484,15 @@ def train_step(forward_step_func, data_iterator,
+ 
+         if unwrapped_model.share_word_embeddings:
+             word_embeddings_weight = unwrapped_model.word_embeddings_weight()
+-            if args.DDP_impl == 'local':
+-                grad = word_embeddings_weight.main_grad
+-            else:
+-                grad = word_embeddings_weight.grad
++            grad = word_embeddings_weight.grad
++            # FastMoE does not have main_grad field
++            # if args.DDP_impl == 'local':
++            #     grad = word_embeddings_weight.main_grad
++            # else:
++            #     grad = word_embeddings_weight.grad
+             torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
+ 
+-    # All-reduce position_embeddings grad across first (encoder) and split (decoder) 
++    # All-reduce position_embeddings grad across first (encoder) and split (decoder)
+     # stages to ensure that position embeddings parameters stay in sync.
+     # This should only run for T5 models with pipeline parallelism
+     if mpu.is_rank_in_position_embedding_group() and \
+@@ -568,26 +588,13 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
+     # Logging.
+     timers_to_log = []
+ 
+-    def add_to_logging(name):
+-        if name in timers.timers:
+-            timers_to_log.append(name)
+-    add_to_logging('forward-compute')
+-    add_to_logging('forward-recv')
+-    add_to_logging('forward-send')
+-    add_to_logging('forward-backward-send-forward-backward-recv')
+-    add_to_logging('backward-compute')
+-    add_to_logging('backward-recv')
+-    add_to_logging('backward-send')
+-    add_to_logging('backward-send-forward-recv')
+-    add_to_logging('backward-send-backward-recv')
+-    add_to_logging('backward-params-all-reduce')
+-    add_to_logging('backward-embedding-all-reduce')
+-    add_to_logging('optimizer-copy-to-main-grad')
+-    add_to_logging('optimizer-unscale-and-check-inf')
+-    add_to_logging('optimizer-clip-main-grad')
+-    add_to_logging('optimizer-copy-main-to-model-params')
+-    add_to_logging('optimizer')
+-    add_to_logging('batch-generator')
++    # FastMoE add several timers.
++    # For simplicity, add all timers to log.
++    def add_all():
++        for name in timers.timers:
++             timers_to_log.append(name)
++
++    add_all()
+ 
+     # Calculate batch size.
+     batch_size = args.micro_batch_size * args.data_parallel_size * \
